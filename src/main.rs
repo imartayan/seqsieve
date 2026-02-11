@@ -521,7 +521,9 @@ fn compute_entropy(count: &[usize]) -> f64 {
     }
     count
         .iter()
-        .map(|&c| {
+        .copied()
+        .filter(|&c| c > 0)
+        .map(|c| {
             let p = c as f64 / total;
             -p * p.log2()
         })
