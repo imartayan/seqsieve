@@ -279,6 +279,19 @@ fn is_fasta_file(name: &str) -> bool {
         || name.ends_with(".fasta.zst")
 }
 
+#[inline(always)]
+fn basename<P: AsRef<Path>>(filename: &Path, root: P) -> &str {
+    let basename = filename
+        .strip_prefix(root)
+        .expect("Failed to strip root dir from path")
+        .to_str()
+        .expect("Invalid path encoding");
+    basename
+        .strip_suffix(".gz")
+        .or_else(|| basename.strip_suffix(".zst"))
+        .unwrap_or(basename)
+}
+
 fn filter_file<P: AsRef<Path>>(
     filename: PathBuf,
     root: P,
@@ -290,9 +303,7 @@ fn filter_file<P: AsRef<Path>>(
         .config()
         | COMPUTE_DNA_STRING;
 
-    let basename = filename
-        .strip_prefix(root)
-        .expect("Failed to strip root dir from path");
+    let basename = basename(&filename, root);
     let mut outfiles: SVec<_> = outparams
         .iter()
         .filter_map(|o| {
