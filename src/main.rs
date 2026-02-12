@@ -4,6 +4,7 @@ use helicase::config::advanced::COMPUTE_DNA_STRING;
 use helicase::dna_format::ColumnarDNA;
 use helicase::input::*;
 use helicase::*;
+use indicatif::ProgressBar;
 use jwalk::WalkDir;
 use rayon::prelude::*;
 
@@ -560,6 +561,7 @@ fn main() {
             .to_path_buf()
     };
     let files = fasta_files(&args.path).expect("Failed to get input files");
+    eprintln!("Listed {} files to process", files.len());
 
     let mut profiles = SVec::new_const();
     if let Some(profile) = args.profile {
@@ -593,11 +595,14 @@ fn main() {
         .expect("Failed to open stats file in append mode");
     let stats_writer = Mutex::new(BufWriter::new(stats_file));
 
+    let pb = ProgressBar::new(files.len() as u64);
     files.into_par_iter().for_each(|filename| {
         let stats = filter_file(filename, &root, &outparams);
         let mut writer = stats_writer.lock().unwrap();
         stats.into_iter().for_each(|s| {
             writeln!(writer, "{}", s).expect("Failed to append stats");
         });
+        pb.inc(1);
     });
+    pb.finish_with_message("Done");
 }
