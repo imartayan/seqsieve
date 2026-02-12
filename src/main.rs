@@ -1,7 +1,7 @@
 use arrayvec::ArrayVec;
 use clap::{Parser as ClapParser, ValueEnum};
-use helicase::config::advanced::COMPUTE_DNA_STRING;
-use helicase::dna_format::ColumnarDNA;
+use helicase::config::advanced::COMPUTE_MASK_N;
+use helicase::dna_format::{BitMask, ColumnarDNA};
 use helicase::input::*;
 use helicase::*;
 use indicatif::ProgressBar;
@@ -300,9 +300,11 @@ fn filter_file<P: AsRef<Path>>(
 ) -> SVec<FilterStats> {
     const CONFIG: Config = ParserOptions::default()
         .dna_columnar()
+        .and_dna_string()
         .keep_non_actg()
+        .compute_mask_non_actg()
         .config()
-        | COMPUTE_DNA_STRING;
+        | COMPUTE_MASK_N;
 
     let basename = basename(&filename, root);
     let mut outfiles: SVec<_> = outparams
@@ -329,6 +331,8 @@ fn filter_file<P: AsRef<Path>>(
             FastaParser::<CONFIG, _>::from_file(&filename).expect("Failed to parse file");
         while let Some(_) = parser.next() {
             let seq = parser.get_dna_columnar();
+            let mask_n = parser.get_mask_n();
+            let mask_other = parser.get_mask_non_actg();
             outfiles.iter_mut().for_each(|(stats, _, _)| {
                 stats.seqs_in += 1;
                 stats.bp_in += seq.len();
@@ -339,7 +343,7 @@ fn filter_file<P: AsRef<Path>>(
                 });
                 continue;
             }
-            let metrics = seq_metrics(seq);
+            let metrics = seq_metrics(seq, mask_n, mask_other);
             outfiles
                 .iter_mut()
                 .for_each(|(stats, writer, t)| match metrics.verify(t) {
@@ -387,7 +391,7 @@ fn filter_file<P: AsRef<Path>>(
 }
 
 #[inline(always)]
-fn seq_metrics(seq: &ColumnarDNA) -> SeqMetrics {
+fn seq_metrics(seq: &ColumnarDNA, mask_n: &BitMask, mask_other: &BitMask) -> SeqMetrics {
     let mut count1 = [0; 4];
     let mut count2 = [0; 16];
     let mut n_count = 0;
@@ -397,29 +401,40 @@ fn seq_metrics(seq: &ColumnarDNA) -> SeqMetrics {
 
     let (high_bits, hi) = seq.high_bits();
     let (low_bits, lo) = seq.low_bits();
+    let (n_bits, vn) = mask_n.bits();
+    let (other_bits, other) = mask_other.bits();
     let (carry_hi, carry_lo) = seq.get(0);
     let mut carry_hi = !carry_hi as u64;
     let mut carry_lo = !carry_lo as u64;
+    let mut carry_mask = 0;
 
-    for (&hi, &lo) in high_bits.iter().zip(low_bits) {
-        // TODO check N mask
+    for ((&hi, &lo), (&vn, &other)) in high_bits
+        .iter()
+        .zip(low_bits)
+        .zip(n_bits.iter().zip(other_bits))
+    {
+        let mask = !other;
 
         let prev_hi = (hi << 1) | carry_hi;
         let prev_lo = (lo << 1) | carry_lo;
-        let va = !hi & !lo;
-        let vc = !hi & lo;
-        let vt = hi & !lo;
-        let vg = hi & lo;
+        let prev_mask = (mask << 1) | carry_mask;
+
+        let va = (!hi & !lo) & mask;
+        let vc = (!hi & lo) & mask;
+        let vt = (hi & !lo) & mask;
+        let vg = (hi & lo) & mask;
 
         count1[0] += va.count_ones() as usize;
         count1[1] += vc.count_ones() as usize;
         count1[2] += vt.count_ones() as usize;
         count1[3] += vg.count_ones() as usize;
+        n_count += vn.count_ones() as usize;
+        invalid_nuc |= (other & !vn) != 0;
 
-        let prev_a = !prev_hi & !prev_lo;
-        let prev_c = !prev_hi & prev_lo;
-        let prev_t = prev_hi & !prev_lo;
-        let prev_g = prev_hi & prev_lo;
+        let prev_a = (!prev_hi & !prev_lo) & prev_mask;
+        let prev_c = (!prev_hi & prev_lo) & prev_mask;
+        let prev_t = (prev_hi & !prev_lo) & prev_mask;
+        let prev_g = (prev_hi & prev_lo) & prev_mask;
         count2[0] += (prev_a & va).count_ones() as usize;
         count2[1] += (prev_a & vc).count_ones() as usize;
         count2[2] += (prev_a & vt).count_ones() as usize;
@@ -439,7 +454,7 @@ fn seq_metrics(seq: &ColumnarDNA) -> SeqMetrics {
 
         let eq_hi = !(prev_hi ^ hi);
         let eq_lo = !(prev_lo ^ lo);
-        let mut eq = eq_hi & eq_lo;
+        let mut eq = (eq_hi & eq_lo) & (prev_mask & mask);
         if eq == !0 {
             cur_hpoly += 64;
         } else {
@@ -458,15 +473,17 @@ fn seq_metrics(seq: &ColumnarDNA) -> SeqMetrics {
 
         carry_hi = hi >> 63;
         carry_lo = lo >> 63;
+        carry_mask = mask >> 63;
     }
 
     let rem = seq.len() % 64;
     if rem > 0 {
-        let mask = !0 >> (64 - rem);
-        // TODO check N mask
+        let mask = !other & (!0 >> (64 - rem));
 
         let prev_hi = (hi << 1) | carry_hi;
         let prev_lo = (lo << 1) | carry_lo;
+        let prev_mask = (mask << 1) | carry_mask;
+
         let va = (!hi & !lo) & mask;
         let vc = (!hi & lo) & mask;
         let vt = (hi & !lo) & mask;
@@ -476,11 +493,13 @@ fn seq_metrics(seq: &ColumnarDNA) -> SeqMetrics {
         count1[1] += vc.count_ones() as usize;
         count1[2] += vt.count_ones() as usize;
         count1[3] += vg.count_ones() as usize;
+        n_count += vn.count_ones() as usize;
+        invalid_nuc |= (other & !vn) != 0;
 
-        let prev_a = (!prev_hi & !prev_lo) & mask;
-        let prev_c = (!prev_hi & prev_lo) & mask;
-        let prev_t = (prev_hi & !prev_lo) & mask;
-        let prev_g = (prev_hi & prev_lo) & mask;
+        let prev_a = (!prev_hi & !prev_lo) & prev_mask;
+        let prev_c = (!prev_hi & prev_lo) & prev_mask;
+        let prev_t = (prev_hi & !prev_lo) & prev_mask;
+        let prev_g = (prev_hi & prev_lo) & prev_mask;
         count2[0] += (prev_a & va).count_ones() as usize;
         count2[1] += (prev_a & vc).count_ones() as usize;
         count2[2] += (prev_a & vt).count_ones() as usize;
@@ -500,7 +519,7 @@ fn seq_metrics(seq: &ColumnarDNA) -> SeqMetrics {
 
         let eq_hi = !(prev_hi ^ hi);
         let eq_lo = !(prev_lo ^ lo);
-        let mut eq = (eq_hi & eq_lo) & mask;
+        let mut eq = (eq_hi & eq_lo) & (prev_mask & mask);
 
         let t = eq.trailing_ones();
         cur_hpoly += t;
